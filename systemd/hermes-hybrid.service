@@ -1,0 +1,33 @@
+[Unit]
+Description=Hermes Hybrid - AI Agent Gateway
+After=network.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/root/hermes-hybrid/gateway
+ExecStart=/root/hermes-hybrid/gateway/target/release/hermes-gateway
+Restart=on-failure
+RestartSec=10s
+
+# 环境变量
+Environment="RUST_LOG=info"
+Environment="PYTHONPATH=/root/hermes-hybrid/agent"
+
+# 资源限制（根据实际情况调整）
+MemoryMax=512M
+MemoryHigh=384M
+
+# 日志
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=hermes-hybrid
+
+# 安全加固（可选）
+# PrivateTmp=true
+# NoNewPrivileges=true
+# ProtectSystem=strict
+# ProtectHome=true
+
+[Install]
+WantedBy=multi-user.target

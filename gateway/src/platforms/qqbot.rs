@@ -1,0 +1,359 @@
+//! QQBot platform adapter
+//!
+//! Connects to QQ Bot Official API v2 via WebSocket and REST API.
+
+use futures_util::{SinkExt, StreamExt};
+use reqwest::Client as HttpClient;
+use serde::{Deserialize, Serialize};
+use std::sync::Arc;
+use tokio::sync::mpsc;
+use tokio_tungstenite::{connect_async, tungstenite::Message};
+use tracing::{debug, error, info, warn};
+
+use crate::router::{Attachment, InboundMessage, OutboundMessage};
+
+/// QQBot configuration
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct QQBotConfig {
+    pub app_id: String,
+    pub client_secret: String,
+    pub api_base: Option<String>,
+    pub sandbox: Option<bool>,
+}
+
+/// QQBot adapter
+pub struct QQBotAdapter {
+    config: QQBotConfig,
+    http_client: HttpClient,
+    inbound_tx: mpsc::Sender<InboundMessage>,
+    access_token: Arc<tokio::sync::RwLock<Option<String>>>,
+}
+
+impl QQBotAdapter {
+    pub fn new(
+        config: QQBotConfig,
+        inbound_tx: mpsc::Sender<InboundMessage>,
+    ) -> Self {
+        let http_client = HttpClient::builder()
+            .user_agent("Hermes-Hybrid-Gateway/0.1.0")
+            .build()
+            .expect("Failed to create HTTP client");
+
+        Self {
+            config,
+            http_client,
+            inbound_tx,
+            access_token: Arc::new(tokio::sync::RwLock::new(None)),
+        }
+    }
+
+    /// Start the adapter (connect to WebSocket gateway)
+    pub async fn start(&self) -> Result<(), QQBotError> {
+        info!("🤖 Starting QQBot adapter...");
+
+        // Get access token
+        self.authenticate().await?;
+
+        // Get WebSocket gateway URL
+        let gateway_url = self.get_gateway_url().await?;
+        info!("WebSocket gateway URL: {}", gateway_url);
+
+        // Connect to WebSocket
+        let (ws_stream, _) = connect_async(&gateway_url)
+            .await
+            .map_err(|e| QQBotError::WebSocketError(e.to_string()))?;
+
+        info!("✅ Connected to QQ WebSocket gateway");
+
+        let (mut write, mut read) = ws_stream.split();
+
+        // Heartbeat task
+        let heartbeat_interval = tokio::time::Duration::from_secs(30);
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(heartbeat_interval);
+            loop {
+                interval.tick().await;
+                if let Err(e) = write.send(Message::Ping(vec![])).await {
+                    error!("Failed to send WebSocket ping: {}", e);
+                    break;
+                }
+            }
+        });
+
+        // Message handler
+        let inbound_tx = self.inbound_tx.clone();
+        while let Some(msg) = read.next().await {
+            match msg {
+                Ok(Message::Text(text)) => {
+                    if let Err(e) = self.handle_websocket_message(&text, &inbound_tx).await {
+                        error!("Failed to handle WebSocket message: {}", e);
+                    }
+                }
+                Ok(Message::Close(_)) => {
+                    warn!("WebSocket closed by server");
+                    break;
+                }
+                Err(e) => {
+                    error!("WebSocket error: {}", e);
+                    break;
+                }
+                _ => {}
+            }
+        }
+
+        warn!("WebSocket connection closed");
+        Ok(())
+    }
+
+    /// Authenticate and get access token
+    async fn authenticate(&self) -> Result<(), QQBotError> {
+        let api_base = self
+            .config
+            .api_base
+            .as_deref()
+            .unwrap_or("https://bots.qq.com");
+
+        let url = format!("{}/app/getAppAccessToken", api_base);
+
+        let body = serde_json::json!({
+            "appId": self.config.app_id,
+            "clientSecret": self.config.client_secret,
+        });
+
+        let resp = self
+            .http_client
+            .post(&url)
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| QQBotError::HttpError(e.to_string()))?;
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let text = resp.text().await.unwrap_or_default();
+            return Err(QQBotError::AuthError(format!(
+                "Failed to authenticate: {} - {}",
+                status, text
+            )));
+        }
+
+        let data: serde_json::Value = resp
+            .json()
+            .await
+            .map_err(|e| QQBotError::HttpError(e.to_string()))?;
+
+        let access_token = data["access_token"]
+            .as_str()
+            .ok_or_else(|| QQBotError::AuthError("No access_token in response".to_string()))?
+            .to_string();
+
+        *self.access_token.write().await = Some(access_token.clone());
+
+        info!("✅ QQBot authenticated");
+        Ok(())
+    }
+
+    /// Get WebSocket gateway URL
+    async fn get_gateway_url(&self) -> Result<String, QQBotError> {
+        let api_base = self
+            .config
+            .api_base
+            .as_deref()
+            .unwrap_or("https://api.sgroup.qq.com");
+
+        let url = format!("{}/gateway", api_base);
+
+        let token = self
+            .access_token
+            .read()
+            .await
+            .as_ref()
+            .ok_or_else(|| QQBotError::AuthError("No access token".to_string()))?
+            .clone();
+
+        let resp = self
+            .http_client
+            .get(&url)
+            .header("Authorization", format!("QQBot {}", token))
+            .send()
+            .await
+            .map_err(|e| QQBotError::HttpError(e.to_string()))?;
+
+        let data: serde_json::Value = resp
+            .json()
+            .await
+            .map_err(|e| QQBotError::HttpError(e.to_string()))?;
+
+        let gateway_url = data["url"]
+            .as_str()
+            .ok_or_else(|| QQBotError::WebSocketError("No gateway URL in response".to_string()))?
+            .to_string();
+
+        Ok(gateway_url)
+    }
+
+    /// Handle WebSocket message
+    async fn handle_websocket_message(
+        &self,
+        text: &str,
+        inbound_tx: &mpsc::Sender<InboundMessage>,
+    ) -> Result<(), QQBotError> {
+        let data: serde_json::Value = serde_json::from_str(text)
+            .map_err(|e| QQBotError::ParseError(e.to_string()))?;
+
+        // Parse event type
+        let event_type = data["t"].as_str().unwrap_or("UNKNOWN");
+
+        debug!("Received QQ event: {}", event_type);
+
+        match event_type {
+            "MESSAGE_CREATE" | "C2C_MESSAGE_CREATE" => {
+                self.handle_message_event(&data, inbound_tx).await?;
+            }
+            "READY" => {
+                info!("QQBot session ready");
+            }
+            _ => {
+                debug!("Unhandled event type: {}", event_type);
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Handle message event
+    async fn handle_message_event(
+        &self,
+        data: &serde_json::Value,
+        inbound_tx: &mpsc::Sender<InboundMessage>,
+    ) -> Result<(), QQBotError> {
+        let d = &data["d"];
+
+        let chat_id = d["author"]["id"]
+            .as_str()
+            .or_else(|| d["guild_id"].as_str())
+            .ok_or_else(|| QQBotError::ParseError("No chat_id".to_string()))?
+            .to_string();
+
+        let user_id = d["author"]["id"]
+            .as_str()
+            .ok_or_else(|| QQBotError::ParseError("No user_id".to_string()))?
+            .to_string();
+
+        let text = d["content"]
+            .as_str()
+            .unwrap_or("")
+            .to_string();
+
+        // Parse attachments
+        let mut attachments = Vec::new();
+        if let Some(attachments_array) = d["attachments"].as_array() {
+            for att in attachments_array {
+                if let Some(url) = att["url"].as_str() {
+                    attachments.push(Attachment {
+                        url: url.to_string(),
+                        mime_type: att["content_type"]
+                            .as_str()
+                            .unwrap_or("application/octet-stream")
+                            .to_string(),
+                        filename: att["filename"].as_str().map(|s| s.to_string()),
+                    });
+                }
+            }
+        }
+
+        let msg = InboundMessage {
+            platform: "qqbot".to_string(),
+            chat_id,
+            user_id,
+            text,
+            attachments,
+            reply_to_message_id: d["message_reference"]["message_id"]
+                .as_str()
+                .map(|s| s.to_string()),
+        };
+
+        inbound_tx
+            .send(msg)
+            .await
+            .map_err(|e| QQBotError::InternalError(format!("Failed to send message: {}", e)))?;
+
+        Ok(())
+    }
+
+    /// Send outbound message
+    pub async fn send_message(&self, msg: OutboundMessage) -> Result<(), QQBotError> {
+        let api_base = self
+            .config
+            .api_base
+            .as_deref()
+            .unwrap_or("https://api.sgroup.qq.com");
+
+        let url = format!("{}/v2/users/{}/messages", api_base, msg.chat_id);
+
+        let token = self
+            .access_token
+            .read()
+            .await
+            .as_ref()
+            .ok_or_else(|| QQBotError::AuthError("No access token".to_string()))?
+            .clone();
+
+        let body = if msg.is_streaming {
+            // Use C2C streaming protocol
+            serde_json::json!({
+                "content": msg.text,
+                "msg_type": 0,
+                "msg_id": uuid::Uuid::new_v4().to_string(),
+            })
+        } else {
+            serde_json::json!({
+                "content": msg.text,
+                "msg_type": 0,
+            })
+        };
+
+        let resp = self
+            .http_client
+            .post(&url)
+            .header("Authorization", format!("QQBot {}", token))
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| QQBotError::HttpError(e.to_string()))?;
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let text = resp.text().await.unwrap_or_default();
+            return Err(QQBotError::SendError(format!(
+                "Failed to send message: {} - {}",
+                status, text
+            )));
+        }
+
+        debug!("Message sent to chat: {}", msg.chat_id);
+        Ok(())
+    }
+}
+
+/// QQBot error types
+#[derive(Debug, thiserror::Error)]
+pub enum QQBotError {
+    #[error("HTTP error: {0}")]
+    HttpError(String),
+
+    #[error("WebSocket error: {0}")]
+    WebSocketError(String),
+
+    #[error("Authentication error: {0}")]
+    AuthError(String),
+
+    #[error("Parse error: {0}")]
+    ParseError(String),
+
+    #[error("Send error: {0}")]
+    SendError(String),
+
+    #[error("Internal error: {0}")]
+    InternalError(String),
+}

@@ -336,8 +336,8 @@ impl QQBotAdapter {
             .ok_or_else(|| QQBotError::AuthError("No access token".to_string()))?
             .clone();
 
-        // Intents: C2C messages (1<<25) + Direct messages (1<<12) + Guild @mentions (1<<30) + Guild messages (1<<9)
-        let intents = (1u64 << 25) | (1u64 << 30) | (1u64 << 12) | (1u64 << 9);
+        // Intents: C2C (1<<25) + Guild @mentions (1<<30) + DMs (1<<12) + Guild messages (1<<26)
+        let intents = (1u64 << 25) | (1u64 << 30) | (1u64 << 12) | (1u64 << 26);
 
         let identify = serde_json::json!({
             "op": 2,

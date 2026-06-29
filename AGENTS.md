@@ -4,6 +4,82 @@
 
 ---
 
+## Active Handoff — 2026-06-29 22:02 CST
+
+**状态**: Phase 3 完成，agent_bridge.py 实现并测试通过，Gateway ↔ Agent JSON-RPC 通信验证成功。
+
+**当前进度**: 80% (Phase 3/5 完成)
+
+### 最新完成
+
+✅ **agent_bridge.py 完整实现** (336 行)
+- JSON-RPC 2.0 server (stdin/stdout line-delimited)
+- Session 管理 (ping, start_session, handle_message, interrupt, end_session)
+- 流式通知 (typing_start, stream_chunk, message_complete)
+- 所有集成测试通过
+
+✅ **Rust Gateway 子进程管理修复**
+- 修复 Tokio BufReader panic (用 `Arc<Mutex<>>` 替代裸指针)
+- 文件：`gateway/src/agent_bridge/subprocess.rs`, `gateway/src/agent_bridge/mod.rs`
+
+✅ **测试验证**
+- 脚本：`scripts/test_bridge.sh`
+- 结果：ping ✓, start_session ✓, streaming messages ✓
+- 端到端通信：Gateway 成功启动 Python agent 子进程并完成 JSON-RPC 握手
+
+### 下一步：Phase 4 - 真实 Agent 集成
+
+**目标**: 将 agent_bridge.py 连接到真实的 Python Agent (conversation_loop, AIAgent)
+
+**关键任务** (预计 1-2 天):
+
+1. **安装 Python 依赖** (30分钟)
+   ```bash
+   cd agent && python3 -m pip install -e .
+   # 验证: python3 -c "from agent.conversation_loop import run_conversation"
+   ```
+
+2. **修改 `start_session()`** (1小时)
+   - 导入并初始化真实 `AIAgent` 实例
+   - 加载工具和 memory manager
+   - 返回实际的 tools 和 snapshots 数量
+
+3. **修改 `handle_message()`** (2-3小时)
+   - 调用 `agent.run_conversation(text)`
+   - 添加流式回调：`on_text_chunk()`, `on_tool_start()`, `on_tool_complete()`
+   - 发送 `tool_started` / `tool_completed` 通知
+
+4. **端到端测试** (1小时)
+   - 验证真实 LLM 调用
+   - 验证工具执行和通知
+   - 确认流式输出正确
+
+**已知约束**:
+- Python agent 使用 `pyproject.toml` 管理依赖（不是 requirements.txt）
+- stdout 必须 line-buffered 且每条消息以 `\n` 结尾
+- stderr 用于日志，不影响协议通信
+
+**关键文件**:
+- `agent/hermes_cli/agent_bridge.py` — 当前为占位实现，需集成真实 agent
+- `agent/agent/conversation_loop.py` — `run_conversation()` 函数
+- `docs/protocol.md` — JSON-RPC 协议规范
+- `docs/phase3_completion.md` — Phase 3 详细报告
+
+**参考实现**:
+- 原版 Python: `/home/ysltr/builds/hermes/hermes-agent` (本地)
+- 原版 Python: `/root/.hermes/hermes-agent` (Armbian)
+
+**测试命令**:
+```bash
+# 运行集成测试
+bash scripts/test_bridge.sh
+
+# 启动 Gateway (端到端)
+cd gateway && AGENT_DIR=$(pwd)/../agent cargo run
+```
+
+---
+
 ## 🎉 Phase 3 完成 — 2026-06-29 22:00 CST
 
 **agent_bridge.py 实现完成！Gateway ↔ Agent 通信已验证通过。**

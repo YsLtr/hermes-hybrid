@@ -1,72 +1,85 @@
-name: Release Build
+name: Release
 
 on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to create, for example v0.2.0-alpha. Leave empty to build artifacts only."
+        required: false
+        type: string
   push:
     tags:
-      - 'v*'
-  workflow_dispatch:
+      - "v*"
 
 permissions:
   contents: write
 
 jobs:
   build:
-    name: Build ${{ matrix.asset_name }}
-    runs-on: ${{ matrix.os }}
+    name: Build ${{ matrix.asset }}
+    runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
       matrix:
         include:
-          # Linux ARM64 (for Armbian)
-          - os: ubuntu-24.04-arm64
-            asset_name: hermes-gateway-linux-aarch64
-          # Linux x86_64
-          - os: ubuntu-latest
-            asset_name: hermes-gateway-linux-x86_64
+          - runner: ubuntu-24.04-arm
+            asset: hermes-gateway-linux-aarch64
+          - runner: ubuntu-24.04
+            asset: hermes-gateway-linux-x86_64
 
     steps:
-      - name: Checkout code
+      - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Install Rust toolchain
+      - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
 
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
 
-      - name: Build gateway
+      - name: Build hermes-gateway
         run: cargo build --release -p hermes-gateway --locked
 
       - name: Package
         run: |
           mkdir -p dist
           cp target/release/hermes-gateway dist/hermes-gateway
-          tar -C dist -czf "${{ matrix.asset_name }}.tar.gz" hermes-gateway
+          tar -C dist -czf "${{ matrix.asset }}.tar.gz" hermes-gateway
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ matrix.asset_name }}
-          path: ${{ matrix.asset_name }}.tar.gz
+          name: ${{ matrix.asset }}
+          path: ${{ matrix.asset }}.tar.gz
           if-no-files-found: error
 
   release:
-    name: Create Release
+    name: Publish release
     needs: build
-    runs-on: ubuntu-latest
-    if: startsWith(github.ref, 'refs/tags/')
+    if: github.event_name == 'push' || inputs.tag != ''
+    runs-on: ubuntu-24.04
 
     steps:
-      - name: Download all artifacts
+      - name: Download artifacts
         uses: actions/download-artifact@v4
         with:
           path: dist
           merge-multiple: true
 
-      - name: Create Release
+      - name: Resolve tag
+        id: tag
+        run: |
+          if [ "${{ github.event_name }}" = "push" ]; then
+            echo "tag=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
+          else
+            echo "tag=${{ inputs.tag }}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Create GitHub release
         uses: softprops/action-gh-release@v2
         with:
+          tag_name: ${{ steps.tag.outputs.tag }}
+          name: ${{ steps.tag.outputs.tag }}
           files: dist/*.tar.gz
           draft: false
-          prerelease: ${{ contains(github.ref, 'alpha') || contains(github.ref, 'beta') }}
-          generate_release_notes: true
+          prerelease: ${{ contains(steps.tag.outputs.tag, 'alpha') || contains(steps.tag.outputs.tag, 'beta') }}

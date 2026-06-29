@@ -47,11 +47,28 @@ impl QQBotAdapter {
         }
     }
 
-    /// Start the adapter (connect to WebSocket gateway)
+    /// Start the adapter (connect to WebSocket gateway with auto-reconnect)
     pub async fn start(&self) -> Result<(), QQBotError> {
         info!("🤖 Starting QQBot adapter...");
 
-        // Get access token
+        loop {
+            match self.connect_and_listen().await {
+                Ok(_) => {
+                    warn!("WebSocket connection closed, reconnecting in 5 seconds...");
+                }
+                Err(e) => {
+                    error!("WebSocket connection error: {}, reconnecting in 10 seconds...", e);
+                    tokio::time::sleep(tokio::time::Duration::from_secs(10)).await;
+                    continue;
+                }
+            }
+            tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
+        }
+    }
+
+    /// Connect to WebSocket and listen for messages
+    async fn connect_and_listen(&self) -> Result<(), QQBotError> {
+        // Re-authenticate before each connection
         self.authenticate().await?;
 
         // Get WebSocket gateway URL
@@ -65,15 +82,17 @@ impl QQBotAdapter {
 
         info!("✅ Connected to QQ WebSocket gateway");
 
-        let (mut write, mut read) = ws_stream.split();
+        let (write, mut read) = ws_stream.split();
+        let write = Arc::new(tokio::sync::Mutex::new(write));
 
         // Heartbeat task
-        let heartbeat_interval = tokio::time::Duration::from_secs(30);
-        tokio::spawn(async move {
-            let mut interval = tokio::time::interval(heartbeat_interval);
+        let write_clone = write.clone();
+        let heartbeat_handle = tokio::spawn(async move {
+            let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(30));
             loop {
                 interval.tick().await;
-                if let Err(e) = write.send(Message::Ping(vec![])).await {
+                let mut ws = write_clone.lock().await;
+                if let Err(e) = ws.send(Message::Ping(vec![])).await {
                     error!("Failed to send WebSocket ping: {}", e);
                     break;
                 }
@@ -89,6 +108,9 @@ impl QQBotAdapter {
                         error!("Failed to handle WebSocket message: {}", e);
                     }
                 }
+                Ok(Message::Pong(_)) => {
+                    // Pong received, connection is alive
+                }
                 Ok(Message::Close(_)) => {
                     warn!("WebSocket closed by server");
                     break;
@@ -100,6 +122,9 @@ impl QQBotAdapter {
                 _ => {}
             }
         }
+
+        // Cancel heartbeat task
+        heartbeat_handle.abort();
 
         warn!("WebSocket connection closed");
         Ok(())

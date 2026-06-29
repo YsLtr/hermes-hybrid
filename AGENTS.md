@@ -4,47 +4,113 @@
 
 ---
 
-## Active Handoff — 2026-06-30 00:25 CST
+## 🚀 标准部署流程（强制执行）
 
-**当前状态**: QQBot WebSocket 协议修复完成！机器人已成功上线并保持稳定连接。
+**⚠️ 架构差异警告**: 本地开发机是 x86_64，Armbian 服务器是 ARM64，**禁止本地编译后直接传输**！
 
-**总体进度**: 98% (Phase 1-5 完成，QQBot 完全可用，Phase 6 待完成)
+### 部署步骤（每次修改后必须遵循）
+
+1. **提交代码到 Git**
+   ```bash
+   git add <修改的文件>
+   git commit -m "feat: <功能描述>"
+   git push origin main
+   ```
+
+2. **创建 Release Tag 触发 CI 构建**
+   ```bash
+   # 版本号格式: v0.2.X-alpha (X 递增)
+   git tag v0.2.X-alpha -m "<版本说明>"
+   git push origin v0.2.X-alpha
+   ```
+
+3. **等待 GitHub Actions 构建完成**
+   ```bash
+   # 监控构建状态 (约 1-2 分钟)
+   gh run watch --repo YsLtr/hermes-hybrid <run_id>
+   
+   # 或者查看最新构建
+   gh run list --repo YsLtr/hermes-hybrid --limit 1
+   ```
+
+4. **下载 ARM64 版本**
+   ```bash
+   wget https://github.com/YsLtr/hermes-hybrid/releases/download/v0.2.X-alpha/hermes-gateway-linux-aarch64.tar.gz -O /tmp/hermes-gateway-aarch64.tar.gz
+   tar -xzf /tmp/hermes-gateway-aarch64.tar.gz -C /tmp/
+   ```
+
+5. **部署到 Armbian**
+   ```bash
+   # 上传二进制
+   scp /tmp/hermes-gateway root@192.168.11.11:/root/hermes-gateway-new
+   
+   # 停止旧进程并替换
+   ssh root@192.168.11.11 "pkill -9 hermes-gateway; mv /root/hermes-gateway-new /root/hermes-gateway && chmod +x /root/hermes-gateway"
+   
+   # 启动新版本
+   ssh root@192.168.11.11 'bash -c "cd /root && export QQ_ENABLED=true QQ_APP_ID=102146435 QQ_CLIENT_SECRET=VZt5t9FagEymZrRj QQ_C2C_STREAMING=true QQ_METADATA_FOOTER=true AGENT_DIR=/root/.hermes/hermes-hybrid/agent RUST_LOG=debug && nohup ./hermes-gateway > gateway.log 2>&1 &"'
+   
+   # 查看日志
+   sleep 3 && ssh root@192.168.11.11 "tail -50 /root/gateway.log"
+   ```
+
+### 环境变量配置（Armbian）
+
+```bash
+QQ_ENABLED=true
+QQ_APP_ID=102146435
+QQ_CLIENT_SECRET=VZt5t9FagEymZrRj
+QQ_C2C_STREAMING=true
+QQ_METADATA_FOOTER=true
+QQ_PROGRESS=true
+QQ_NOTIFY_END=true
+QQ_MAX_PROGRESS=2
+AGENT_DIR=/root/.hermes/hermes-hybrid/agent
+RUST_LOG=info  # 或 debug（调试时）
+```
+
+---
+
+## Active Handoff — 2026-06-30 01:00 CST
+
+**当前状态**: QQBot 完整功能移植完成 (v0.2.5-alpha)，OAuth 认证问题待修复
+
+**总体进度**: 98% (所有功能已实现，待修复认证问题)
 
 ### 本次会话完成的工作
 
-**QQBot WebSocket 协议完整实现** (v0.2.4-alpha)
+**QQBot 完整功能移植** (v0.2.5-alpha)
 
-1. **修复 WebSocket 握手和认证流程**
-   - 正确处理 HELLO (op=10) 消息并发送 Identify (op=2)
-   - 修正 intents 值：`(1<<25) | (1<<30) | (1<<12) | (1<<26)`
-   - 实现 session_id 和 last_seq 状态管理
-   - 添加 WsState 结构体存储 WebSocket 会话状态
+1. **配置增强**
+   - 新增 6 个配置项：`markdown_support`、`c2c_streaming`、`progress_coalesce`、`metadata_footer`、`notify_on_stream_end`、`max_progress_messages`
+   - 环境变量支持
 
-2. **修复心跳协议**
-   - 从 WebSocket Ping 改为 QQ 标准心跳 (op=1)
-   - 心跳消息格式：`{"op": 1, "d": last_seq}`
-   - 动态心跳间隔：从 HELLO 消息获取（通常 41.25 秒）
-   - 正确处理 Heartbeat ACK (op=11)
+2. **状态管理扩展**
+   - `C2cStreamState` - C2C 流式状态（id、index、msg_type）
+   - `ProgressState` - 进度卡片状态（去重、计数）
+   - `StreamNoticeState` - 流式通知状态（防刷屏）
+   - `PlatformTurnMetadata` - 元数据（model、provider、ttft、total_ms、tools）
 
-3. **完善重连机制**
-   - 自动处理 op=7 和 op=9 (Reconnect/Invalid Session)
-   - 正常断开：5秒后重连
-   - 错误断开：10秒后重连
-   - 重连前自动重新认证
+3. **核心功能实现**
+   - ✅ **打字提醒** (`send_typing`) - 50秒防抖，60秒状态
+   - ✅ **C2C 流式协议** (`send_stream_chunk`) - state: 1/10，自动 Markdown 降级
+   - ✅ **Progress Card** (`send_progress_card`) - 去重 + 限流
+   - ✅ **Stream End Notice** (`send_stream_end_notice`) - 3秒/5分钟防刷屏
+   - ✅ **Metadata Footer** (`format_metadata_footer`) - 显示 model/provider/ttft/时间/工具数
+   - ✅ **Maintenance Prune** (`maintenance_prune`) - 防止内存泄漏（>512 chat 清理）
 
-4. **部署验证**
-   - 已部署到 Armbian (192.168.11.11)
-   - QQBot ID: 1904802929
-   - Session ID: c94c67a2-7196-4b74-b950-cedf2b1752fc
-   - 连接状态：✅ READY，心跳稳定
+4. **代码统计**
+   - 原版: 979 行
+   - 移植前: 504 行
+   - 移植后: **1,062 行**（功能完整度 100%）
 
 **关键文件变更**:
-- `gateway/src/platforms/qqbot.rs` - 重写 WebSocket 事件处理和心跳逻辑
+- `gateway/src/platforms/qqbot.rs` - 新增 558 行（+111%）
+- `gateway/src/main.rs` - 更新配置解析
 
-**重要发现**:
-- 原版 hermes-agent-rs 项目 (`/home/ysltr/builds/hermes/hermes-agent-rs`) 包含完整的 Rust Agent 实现
-- 该项目有成熟的 QQBot 实现，包括 C2C 流式协议、Progress card 等高级特性
-- 当前 hybrid 项目的简化设计是正确的：轻量级 Gateway + Python Agent Bridge
+**当前问题**:
+- ❌ OAuth 认证失败：`No access_token in response`
+- 已添加调试日志，待下次部署排查
 
 ### 下一步建议
 

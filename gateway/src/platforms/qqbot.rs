@@ -289,9 +289,11 @@ impl QQBotAdapter {
             .await
             .map_err(|e| QQBotError::HttpError(e.to_string()))?;
 
+        debug!("QQBot OAuth response: {}", serde_json::to_string_pretty(&data).unwrap_or_default());
+
         let access_token = data["access_token"]
             .as_str()
-            .ok_or_else(|| QQBotError::AuthError("No access_token in response".to_string()))?
+            .ok_or_else(|| QQBotError::AuthError(format!("No access_token in response: {}", data)))?
             .to_string();
 
         *self.access_token.write().await = Some(access_token.clone());

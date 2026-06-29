@@ -4,79 +4,107 @@
 
 ---
 
-## Active Handoff — 2026-06-29 22:02 CST
+## Active Handoff — 2026-06-29 22:40 CST
 
-**状态**: Phase 3 完成，agent_bridge.py 实现并测试通过，Gateway ↔ Agent JSON-RPC 通信验证成功。
+**当前状态**: Phase 3 完成并已部署到 Armbian，Gateway ↔ Agent Bridge 通信正常运行。
 
-**当前进度**: 80% (Phase 3/5 完成)
+**用户意图**: 将 hermes-hybrid 部署到 Armbian (192.168.11.11) 替换原 Python 版本 hermes-agent。
 
-### 最新完成
+### ✅ 已完成（本次会话）
 
-✅ **agent_bridge.py 完整实现** (336 行)
-- JSON-RPC 2.0 server (stdin/stdout line-delimited)
-- Session 管理 (ping, start_session, handle_message, interrupt, end_session)
-- 流式通知 (typing_start, stream_chunk, message_complete)
-- 所有集成测试通过
+1. **GitHub 仓库和 CI/CD**
+   - 创建仓库：https://github.com/YsLtr/hermes-hybrid
+   - 发布 v0.1.0-alpha 和 v0.1.1-alpha
+   - 配置 GitHub Actions 自动构建 ARM64 二进制
+   - 修复交叉编译链接器配置和 workspace target 路径
+   - 二进制文件：`hermes-gateway-linux-aarch64.tar.gz` (1.7MB)
 
-✅ **Rust Gateway 子进程管理修复**
-- 修复 Tokio BufReader panic (用 `Arc<Mutex<>>` 替代裸指针)
-- 文件：`gateway/src/agent_bridge/subprocess.rs`, `gateway/src/agent_bridge/mod.rs`
+2. **Armbian 部署**
+   - 停止原 `hermes-gateway` 服务
+   - 备份原部署：`/root/.hermes/hermes-agent.bak`
+   - 克隆仓库到：`/root/.hermes/hermes-hybrid`
+   - 下载 ARM64 二进制到 `gateway/hermes-gateway`
+   - 创建 `gateway/config.yaml`
+   - 更新 systemd 服务配置：`/etc/systemd/system/hermes-gateway.service`
+   - 服务运行正常：Gateway (PID 38408) + Agent Bridge (PID 38413)
+   - 内存占用：10.4MB
 
-✅ **测试验证**
-- 脚本：`scripts/test_bridge.sh`
-- 结果：ping ✓, start_session ✓, streaming messages ✓
-- 端到端通信：Gateway 成功启动 Python agent 子进程并完成 JSON-RPC 握手
+3. **验证测试**
+   - Agent Bridge 独立测试：✓ ping 响应正常
+   - Gateway 启动测试：✓ 子进程通信正常
+   - systemd 服务：✓ active (running)
 
-### 下一步：Phase 4 - 真实 Agent 集成
+### ⚠️ 当前限制
 
-**目标**: 将 agent_bridge.py 连接到真实的 Python Agent (conversation_loop, AIAgent)
+**无法接收外部消息** — Gateway 只实现了 Agent Bridge 通信（Phase 3），缺少：
+- HTTP API 服务器（无监听端口）
+- QQBot/Telegram 平台适配器
+- 消息路由逻辑
 
-**关键任务** (预计 1-2 天):
+**Agent Bridge 使用占位符** — `handle_message()` 返回模拟响应，未连接真实 AIAgent/LLM。
 
-1. **安装 Python 依赖** (30分钟)
-   ```bash
-   cd agent && python3 -m pip install -e .
-   # 验证: python3 -c "from agent.conversation_loop import run_conversation"
-   ```
+### 📁 关键文件
 
-2. **修改 `start_session()`** (1小时)
-   - 导入并初始化真实 `AIAgent` 实例
-   - 加载工具和 memory manager
-   - 返回实际的 tools 和 snapshots 数量
+**Armbian 部署**:
+- 部署目录：`/root/.hermes/hermes-hybrid/`
+- 二进制：`gateway/hermes-gateway` (ARM64, 1.7MB)
+- 配置：`gateway/config.yaml`
+- 服务：`/etc/systemd/system/hermes-gateway.service`
+- 日志：`journalctl -u hermes-gateway -f`
 
-3. **修改 `handle_message()`** (2-3小时)
-   - 调用 `agent.run_conversation(text)`
-   - 添加流式回调：`on_text_chunk()`, `on_tool_start()`, `on_tool_complete()`
-   - 发送 `tool_started` / `tool_completed` 通知
+**本地开发**:
+- 项目：`/home/ysltr/builds/hermes/hermes-hybrid/`
+- Gateway 入口：`gateway/src/main.rs` (63 行，TODO: HTTP server + 平台适配器)
+- Agent Bridge：`agent/hermes_cli/agent_bridge.py` (336 行，占位实现)
+- CI 配置：`.github/workflows/release.yml`
 
-4. **端到端测试** (1小时)
-   - 验证真实 LLM 调用
-   - 验证工具执行和通知
-   - 确认流式输出正确
+**GitHub**:
+- 仓库：https://github.com/YsLtr/hermes-hybrid
+- 最新 Release：v0.1.1-alpha
+- Actions：自动构建 ARM64（已修复所有 CI 问题）
 
-**已知约束**:
-- Python agent 使用 `pyproject.toml` 管理依赖（不是 requirements.txt）
-- stdout 必须 line-buffered 且每条消息以 `\n` 结尾
-- stderr 用于日志，不影响协议通信
+### 🚀 下一步选项
 
-**关键文件**:
-- `agent/hermes_cli/agent_bridge.py` — 当前为占位实现，需集成真实 agent
-- `agent/agent/conversation_loop.py` — `run_conversation()` 函数
-- `docs/protocol.md` — JSON-RPC 协议规范
-- `docs/phase3_completion.md` — Phase 3 详细报告
+**选项 A: 继续开发 Phase 4/5**（推荐）
+1. Phase 4 - 集成真实 Agent (1-2天)
+   - 修改 `agent_bridge.py`：连接 `AIAgent` 和 `conversation_loop`
+   - 实现真实 LLM 调用和工具执行
+   - 添加流式回调通知
 
-**参考实现**:
-- 原版 Python: `/home/ysltr/builds/hermes/hermes-agent` (本地)
-- 原版 Python: `/root/.hermes/hermes-agent` (Armbian)
+2. Phase 5 - 实现平台适配器 (2-3天)
+   - 在 `gateway/src/main.rs` 添加 HTTP 服务器（Axum）
+   - 实现 QQBot webhook 接收和 C2C 流式协议
+   - 参考：`/root/.hermes/hermes-agent/gateway/adapters/qqbot.py`
 
-**测试命令**:
+**选项 B: 回退到原 Python 版本**
 ```bash
-# 运行集成测试
-bash scripts/test_bridge.sh
-
-# 启动 Gateway (端到端)
-cd gateway && AGENT_DIR=$(pwd)/../agent cargo run
+ssh root@192.168.11.11
+systemctl stop hermes-gateway
+rm -rf /root/.hermes/hermes-hybrid
+mv /root/.hermes/hermes-agent.bak /root/.hermes/hermes-agent
+# 恢复原服务配置: /etc/systemd/system/hermes-gateway.service.bak
+systemctl daemon-reload && systemctl start hermes-gateway
 ```
+
+### 🎯 建议技能
+
+下次会话推荐使用：
+- `/diagnose` - 调试 Gateway HTTP 服务器实现
+- `/code-review` - 审查 Phase 4 Agent 集成代码
+- `/verify` - 验证 QQBot 平台适配器功能
+
+### 🔗 参考文档
+
+- `docs/protocol.md` - JSON-RPC 2.0 协议规范
+- `docs/architecture.md` - 系统架构设计
+- `docs/ci.md` - GitHub Actions 使用说明
+- `scripts/test_bridge.sh` - 集成测试脚本
+
+---
+
+**进度**: 80% (Phase 3/5 完成)  
+**更新时间**: 2026-06-29 22:40 CST  
+**更新者**: Claude (Opus 4.8)
 
 ---
 

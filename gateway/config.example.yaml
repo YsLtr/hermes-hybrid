@@ -1,0 +1,34 @@
+# Hermes Hybrid Gateway Configuration
+
+agent_bridge:
+  # Python executable path
+  python_path: /usr/bin/python3
+
+  # Python agent module to run
+  agent_module: hermes_cli.agent_bridge
+
+  # Working directory for Python agent
+  working_dir: /path/to/hermes-hybrid/agent
+
+  # Heartbeat interval (seconds)
+  heartbeat_interval_secs: 30
+
+  # Request timeout (seconds)
+  request_timeout_secs: 300
+
+  # Auto-restart agent on crash
+  auto_restart: true
+
+  # Max restart attempts
+  max_restart_attempts: 3
+
+# Platform configurations (TODO: add when implementing platforms)
+# platforms:
+#   qqbot:
+#     enabled: true
+#     extra:
+#       app_id: "your-app-id"
+#       client_secret: "your-secret"
+#       c2c_streaming: true
+#       progress_coalesce: true
+#       metadata_footer: true

@@ -1,0 +1,12 @@
+[package]
+name = "hermes-core"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+thiserror = "2.0"
+serde = { version = "1.0", features = ["derive"] }
+async-trait = "0.1"
+
+[dependencies.serde_json]
+version = "1.0"

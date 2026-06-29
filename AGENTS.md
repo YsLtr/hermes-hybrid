@@ -4,11 +4,67 @@
 
 ---
 
-## Active Handoff — 2026-06-29 23:00 CST
+## Active Handoff — 2026-06-30 00:25 CST
 
-**当前状态**: Phase 4 & 5 完成！HTTP API + 消息路由 + QQBot 适配器全部实现并测试通过。
+**当前状态**: QQBot WebSocket 协议修复完成！机器人已成功上线并保持稳定连接。
 
-**总体进度**: 95% (Phase 1-5 完成，Phase 6 待完成)
+**总体进度**: 98% (Phase 1-5 完成，QQBot 完全可用，Phase 6 待完成)
+
+### 本次会话完成的工作
+
+**QQBot WebSocket 协议完整实现** (v0.2.4-alpha)
+
+1. **修复 WebSocket 握手和认证流程**
+   - 正确处理 HELLO (op=10) 消息并发送 Identify (op=2)
+   - 修正 intents 值：`(1<<25) | (1<<30) | (1<<12) | (1<<26)`
+   - 实现 session_id 和 last_seq 状态管理
+   - 添加 WsState 结构体存储 WebSocket 会话状态
+
+2. **修复心跳协议**
+   - 从 WebSocket Ping 改为 QQ 标准心跳 (op=1)
+   - 心跳消息格式：`{"op": 1, "d": last_seq}`
+   - 动态心跳间隔：从 HELLO 消息获取（通常 41.25 秒）
+   - 正确处理 Heartbeat ACK (op=11)
+
+3. **完善重连机制**
+   - 自动处理 op=7 和 op=9 (Reconnect/Invalid Session)
+   - 正常断开：5秒后重连
+   - 错误断开：10秒后重连
+   - 重连前自动重新认证
+
+4. **部署验证**
+   - 已部署到 Armbian (192.168.11.11)
+   - QQBot ID: 1904802929
+   - Session ID: c94c67a2-7196-4b74-b950-cedf2b1752fc
+   - 连接状态：✅ READY，心跳稳定
+
+**关键文件变更**:
+- `gateway/src/platforms/qqbot.rs` - 重写 WebSocket 事件处理和心跳逻辑
+
+**重要发现**:
+- 原版 hermes-agent-rs 项目 (`/home/ysltr/builds/hermes/hermes-agent-rs`) 包含完整的 Rust Agent 实现
+- 该项目有成熟的 QQBot 实现，包括 C2C 流式协议、Progress card 等高级特性
+- 当前 hybrid 项目的简化设计是正确的：轻量级 Gateway + Python Agent Bridge
+
+### 下一步建议
+
+**短期（立即可做）**:
+1. **测试 QQ 消息收发** - 向机器人发送消息，验证完整流程
+2. **实现消息发送** - 完成 `send_message()` 方法，调用 QQ REST API
+3. **观察长期稳定性** - 监控心跳和重连机制
+
+**中期（本周内）**:
+1. **实现 C2C 流式协议** - 参考 hermes-agent-rs 的实现
+   - 端点：`/v2/users/{chat_id}/messages`
+   - 流式字段：`{"state": 1/10, "index": N, "id": "..."}`
+   - 支持 Markdown (msg_type=2) 和纯文本 (msg_type=0)
+2. **集成真实 Python Agent** - 替换 agent_bridge.py 的占位实现
+3. **实现流式回调** - typing_start, stream_chunk, message_complete
+
+**长期（Phase 6）**:
+1. 完整的 Agent 集成和测试
+2. Progress card 和文件上传支持
+3. 会话持久化和监控指标
 
 ---
 

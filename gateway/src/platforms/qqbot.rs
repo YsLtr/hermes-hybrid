@@ -21,12 +21,20 @@ pub struct QQBotConfig {
     pub sandbox: Option<bool>,
 }
 
+/// WebSocket state
+#[derive(Debug, Clone, Default)]
+struct WsState {
+    session_id: Option<String>,
+    last_seq: Option<i64>,
+}
+
 /// QQBot adapter
 pub struct QQBotAdapter {
     config: QQBotConfig,
     http_client: HttpClient,
     inbound_tx: mpsc::Sender<InboundMessage>,
     access_token: Arc<tokio::sync::RwLock<Option<String>>>,
+    ws_state: Arc<tokio::sync::Mutex<WsState>>,
 }
 
 impl QQBotAdapter {
@@ -44,6 +52,7 @@ impl QQBotAdapter {
             http_client,
             inbound_tx,
             access_token: Arc::new(tokio::sync::RwLock::new(None)),
+            ws_state: Arc::new(tokio::sync::Mutex::new(WsState::default())),
         }
     }
 
@@ -85,46 +94,73 @@ impl QQBotAdapter {
         let (write, mut read) = ws_stream.split();
         let write = Arc::new(tokio::sync::Mutex::new(write));
 
-        // Heartbeat task
+        // Heartbeat task - will be started after receiving HELLO
         let write_clone = write.clone();
-        let heartbeat_handle = tokio::spawn(async move {
-            let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(30));
-            loop {
-                interval.tick().await;
-                let mut ws = write_clone.lock().await;
-                if let Err(e) = ws.send(Message::Ping(vec![])).await {
-                    error!("Failed to send WebSocket ping: {}", e);
-                    break;
-                }
-            }
-        });
+        let ws_state_clone = self.ws_state.clone();
+        let mut heartbeat_interval: Option<tokio::time::Interval> = None;
 
-        // Message handler
+        // Message handler loop
         let inbound_tx = self.inbound_tx.clone();
-        while let Some(msg) = read.next().await {
-            match msg {
-                Ok(Message::Text(text)) => {
-                    if let Err(e) = self.handle_websocket_message(&text, &inbound_tx).await {
-                        error!("Failed to handle WebSocket message: {}", e);
+        loop {
+            tokio::select! {
+                // Heartbeat tick
+                _ = async {
+                    if let Some(interval) = &mut heartbeat_interval {
+                        interval.tick().await;
+                    } else {
+                        std::future::pending::<()>().await;
+                    }
+                } => {
+                    // Send QQ heartbeat (op=1) with last sequence
+                    let seq = ws_state_clone.lock().await.last_seq;
+                    let heartbeat = serde_json::json!({"op": 1, "d": seq});
+                    let msg = Message::Text(serde_json::to_string(&heartbeat).unwrap());
+                    if let Err(e) = write_clone.lock().await.send(msg).await {
+                        error!("Failed to send heartbeat: {}", e);
+                        break;
+                    }
+                    debug!("Sent heartbeat with seq={:?}", seq);
+                }
+                // WebSocket messages
+                msg = read.next() => {
+                    let Some(msg) = msg else {
+                        warn!("WebSocket stream ended");
+                        break;
+                    };
+
+                    match msg {
+                        Ok(Message::Text(text)) => {
+                            match self.handle_websocket_message(&text, &inbound_tx, &write).await {
+                                Ok(Some(interval_ms)) => {
+                                    // HELLO received, start heartbeat
+                                    let every = std::time::Duration::from_millis((interval_ms as f64 * 0.8) as u64);
+                                    heartbeat_interval = Some(tokio::time::interval(every.max(std::time::Duration::from_secs(1))));
+                                    info!("Heartbeat started: {}ms interval", interval_ms);
+                                }
+                                Ok(None) => {
+                                    // Normal message processing
+                                }
+                                Err(e) => {
+                                    error!("Failed to handle WebSocket message: {}", e);
+                                }
+                            }
+                        }
+                        Ok(Message::Close(_)) => {
+                            warn!("WebSocket closed by server");
+                            break;
+                        }
+                        Ok(Message::Ping(data)) => {
+                            let _ = write.lock().await.send(Message::Pong(data)).await;
+                        }
+                        Err(e) => {
+                            error!("WebSocket error: {}", e);
+                            break;
+                        }
+                        _ => {}
                     }
                 }
-                Ok(Message::Pong(_)) => {
-                    // Pong received, connection is alive
-                }
-                Ok(Message::Close(_)) => {
-                    warn!("WebSocket closed by server");
-                    break;
-                }
-                Err(e) => {
-                    error!("WebSocket error: {}", e);
-                    break;
-                }
-                _ => {}
             }
         }
-
-        // Cancel heartbeat task
-        heartbeat_handle.abort();
 
         warn!("WebSocket connection closed");
         Ok(())
@@ -218,31 +254,114 @@ impl QQBotAdapter {
     }
 
     /// Handle WebSocket message
+    /// Returns Some(interval_ms) when HELLO is received
     async fn handle_websocket_message(
         &self,
         text: &str,
         inbound_tx: &mpsc::Sender<InboundMessage>,
-    ) -> Result<(), QQBotError> {
+        write: &Arc<tokio::sync::Mutex<futures_util::stream::SplitSink<tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>, Message>>>,
+    ) -> Result<Option<u64>, QQBotError> {
         let data: serde_json::Value = serde_json::from_str(text)
             .map_err(|e| QQBotError::ParseError(e.to_string()))?;
 
-        // Parse event type
-        let event_type = data["t"].as_str().unwrap_or("UNKNOWN");
-
-        debug!("Received QQ event: {}", event_type);
-
-        match event_type {
-            "MESSAGE_CREATE" | "C2C_MESSAGE_CREATE" => {
-                self.handle_message_event(&data, inbound_tx).await?;
-            }
-            "READY" => {
-                info!("QQBot session ready");
-            }
-            _ => {
-                debug!("Unhandled event type: {}", event_type);
-            }
+        // Update sequence number
+        if let Some(seq) = data["s"].as_i64() {
+            self.ws_state.lock().await.last_seq = Some(seq);
         }
 
+        // Parse opcode
+        let op = data["op"].as_u64();
+
+        match op {
+            Some(10) => {
+                // HELLO - get heartbeat interval and send Identify
+                let interval_ms = data["d"]["heartbeat_interval"]
+                    .as_u64()
+                    .unwrap_or(30_000);
+
+                info!("Received HELLO, heartbeat interval: {}ms", interval_ms);
+                self.send_identify(write).await?;
+
+                Ok(Some(interval_ms))
+            }
+            Some(0) => {
+                // Dispatch - handle events
+                let event_type = data["t"].as_str().unwrap_or("UNKNOWN");
+                let d = &data["d"];
+
+                match event_type {
+                    "READY" => {
+                        if let Some(session_id) = d["session_id"].as_str() {
+                            self.ws_state.lock().await.session_id = Some(session_id.to_string());
+                            info!("✅ QQBot session READY (session_id: {})", session_id);
+                        }
+                    }
+                    "MESSAGE_CREATE" | "C2C_MESSAGE_CREATE" | "GROUP_AT_MESSAGE_CREATE" => {
+                        self.handle_message_event(d, inbound_tx).await?;
+                    }
+                    _ => {
+                        debug!("Unhandled event type: {}", event_type);
+                    }
+                }
+
+                Ok(None)
+            }
+            Some(11) => {
+                // Heartbeat ACK
+                debug!("Received heartbeat ACK");
+                Ok(None)
+            }
+            Some(7) | Some(9) => {
+                // Reconnect requested
+                warn!("QQ gateway requested reconnect (op={})", op.unwrap());
+                Err(QQBotError::WebSocketError("Reconnect requested".to_string()))
+            }
+            _ => {
+                debug!("Unknown opcode: {:?}", op);
+                Ok(None)
+            }
+        }
+    }
+
+    /// Send Identify message
+    async fn send_identify(
+        &self,
+        write: &Arc<tokio::sync::Mutex<futures_util::stream::SplitSink<tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>, Message>>>,
+    ) -> Result<(), QQBotError> {
+        let token = self
+            .access_token
+            .read()
+            .await
+            .as_ref()
+            .ok_or_else(|| QQBotError::AuthError("No access token".to_string()))?
+            .clone();
+
+        // Intents: C2C messages (1<<25) + Direct messages (1<<12) + Guild @mentions (1<<30) + Guild messages (1<<9)
+        let intents = (1u64 << 25) | (1u64 << 30) | (1u64 << 12) | (1u64 << 9);
+
+        let identify = serde_json::json!({
+            "op": 2,
+            "d": {
+                "token": format!("QQBot {}", token),
+                "intents": intents,
+                "shard": [0, 1],
+                "properties": {
+                    "$os": "linux",
+                    "$browser": "hermes-hybrid",
+                    "$device": "hermes-hybrid"
+                }
+            }
+        });
+
+        let msg = Message::Text(serde_json::to_string(&identify).unwrap());
+        write
+            .lock()
+            .await
+            .send(msg)
+            .await
+            .map_err(|e| QQBotError::WebSocketError(e.to_string()))?;
+
+        info!("Sent Identify message");
         Ok(())
     }
 

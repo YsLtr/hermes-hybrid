@@ -117,6 +117,12 @@ async fn main() {
             client_secret,
             api_base: std::env::var("QQ_API_BASE").ok(),
             sandbox: std::env::var("QQ_SANDBOX").ok().and_then(|s| s.parse().ok()),
+            markdown_support: std::env::var("QQ_MARKDOWN").ok().and_then(|s| s.parse().ok()).unwrap_or(false),
+            c2c_streaming: std::env::var("QQ_C2C_STREAMING").ok().and_then(|s| s.parse().ok()).unwrap_or(true),
+            progress_coalesce: std::env::var("QQ_PROGRESS").ok().and_then(|s| s.parse().ok()).unwrap_or(true),
+            metadata_footer: std::env::var("QQ_METADATA_FOOTER").ok().and_then(|s| s.parse().ok()).unwrap_or(true),
+            notify_on_stream_end: std::env::var("QQ_NOTIFY_END").ok().and_then(|s| s.parse().ok()).unwrap_or(true),
+            max_progress_messages: std::env::var("QQ_MAX_PROGRESS").ok().and_then(|s| s.parse().ok()).unwrap_or(2),
         };
 
         let qq_adapter = Arc::new(QQBotAdapter::new(qq_config, inbound_tx.clone()));

@@ -1,10 +1,8 @@
-# .gitignore for Hermes Hybrid
-
 # Rust
-/gateway/target/
+target/
+Cargo.lock
 **/*.rs.bk
 *.pdb
-Cargo.lock
 
 # Python
 __pycache__/
@@ -28,48 +26,30 @@ wheels/
 .installed.cfg
 *.egg
 MANIFEST
-*.log
 
 # Virtual environments
-agent/venv/
-agent/.venv/
-agent/env/
-agent/ENV/
+venv/
+ENV/
+env/
 
-# IDEs
+# IDE
 .vscode/
 .idea/
 *.swp
 *.swo
 *~
-.DS_Store
 
-# Configuration files (contains secrets)
-config.yaml
-.env
-*.local.yaml
+# OS
+.DS_Store
+Thumbs.db
 
 # Logs
 *.log
-logs/
 
-# Database
-*.db
-*.sqlite
-*.sqlite3
+# Config files with secrets
+config.yaml
+.env
 
-# Temporary files
-tmp/
-temp/
-*.tmp
-
-# systemd runtime
-*.pid
-
-# Testing
-.pytest_cache/
-.coverage
-htmlcov/
-
-# Documentation builds
-docs/_build/
+# Keep examples
+!config.example.yaml
+!.env.example

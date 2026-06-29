@@ -1,9 +1,10 @@
 //! Subprocess management for the Python agent.
 
 use std::process::Stdio;
-use std::sync::Mutex;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use std::sync::Arc;
+use tokio::io::{AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
+use tokio::sync::Mutex;
 use tracing::{debug, error, info, warn};
 
 use hermes_core::errors::GatewayError;
@@ -15,11 +16,11 @@ pub struct AgentSubprocess {
     /// Child process handle
     child: Child,
 
-    /// stdin pipe to the agent (wrapped in Mutex for interior mutability)
-    stdin: Mutex<ChildStdin>,
+    /// stdin pipe to the agent (wrapped in Arc<Mutex> for shared async access)
+    stdin: Arc<Mutex<ChildStdin>>,
 
-    /// stdout reader from the agent
-    stdout_reader: BufReader<ChildStdout>,
+    /// stdout reader from the agent (wrapped in Arc<Mutex> for shared async access)
+    stdout_reader: Arc<Mutex<BufReader<ChildStdout>>>,
 }
 
 impl AgentSubprocess {
@@ -68,8 +69,8 @@ impl AgentSubprocess {
 
         Ok(Self {
             child,
-            stdin: Mutex::new(stdin),
-            stdout_reader,
+            stdin: Arc::new(Mutex::new(stdin)),
+            stdout_reader: Arc::new(Mutex::new(stdout_reader)),
         })
     }
 
@@ -103,7 +104,7 @@ impl AgentSubprocess {
 
     /// Send a line to the agent's stdin.
     async fn send_line(&self, line: &str) -> Result<(), GatewayError> {
-        let mut stdin = self.stdin.lock().unwrap();
+        let mut stdin = self.stdin.lock().await;
 
         stdin
             .write_all(line.as_bytes())
@@ -124,15 +125,9 @@ impl AgentSubprocess {
         Ok(())
     }
 
-    /// Get a reader for the agent's stdout.
-    pub fn stdout_reader(&mut self) -> StdoutReader {
-        StdoutReader {
-            // SAFETY: Similar to stdin, we need to share the reader across tasks.
-            // This is safe because:
-            // 1. Only one reader task exists per subprocess
-            // 2. The reader is not accessed from multiple threads simultaneously
-            reader_ptr: &mut self.stdout_reader as *mut BufReader<ChildStdout>,
-        }
+    /// Get a cloned reference to the stdout reader for the agent.
+    pub fn stdout_reader(&self) -> Arc<Mutex<BufReader<ChildStdout>>> {
+        Arc::clone(&self.stdout_reader)
     }
 
     /// Terminate the subprocess.
@@ -171,43 +166,6 @@ impl AgentSubprocess {
                 }
                 info!("Agent forcefully killed");
                 Ok(())
-            }
-        }
-    }
-}
-
-/// Reader for agent stdout (thread-safe wrapper).
-pub struct StdoutReader {
-    reader_ptr: *mut BufReader<ChildStdout>,
-}
-
-// SAFETY: We manually ensure thread safety by controlling access patterns.
-unsafe impl Send for StdoutReader {}
-
-impl StdoutReader {
-    /// Read a line from the agent's stdout.
-    pub async fn read_line(&mut self) -> Result<Option<String>, GatewayError> {
-        // SAFETY: See comment in `send_line` - we control access patterns
-        let reader = unsafe { &mut *self.reader_ptr };
-
-        loop {
-            let mut line = String::new();
-            match reader.read_line(&mut line).await {
-                Ok(0) => return Ok(None), // EOF
-                Ok(_) => {
-                    let trimmed = line.trim_end();
-                    if trimmed.is_empty() {
-                        // Skip empty lines and continue loop
-                        continue;
-                    }
-                    return Ok(Some(trimmed.to_string()));
-                }
-                Err(e) => {
-                    return Err(GatewayError::Platform(format!(
-                        "Failed to read from agent stdout: {}",
-                        e
-                    )));
-                }
             }
         }
     }

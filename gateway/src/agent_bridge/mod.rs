@@ -27,6 +27,7 @@ pub mod types;
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use tokio::io::AsyncBufReadExt;
 use tokio::sync::{mpsc, oneshot, RwLock};
 use tracing::{debug, error, info, warn};
 
@@ -128,30 +129,46 @@ impl AgentBridge {
             self.config.python_path, self.config.agent_module
         );
 
-        let mut subprocess = AgentSubprocess::spawn(&self.config).await?;
+        let subprocess = AgentSubprocess::spawn(&self.config).await?;
 
         // Clone Arc references for the reader task
         let pending_requests = Arc::clone(&self.pending_requests);
         let notification_subscribers = Arc::clone(&self.notification_subscribers);
         let subprocess_arc = Arc::clone(&self.subprocess);
 
+        // Get a cloned reference to stdout reader for the reader task
+        let stdout_reader = subprocess.stdout_reader();
+
+        // Store the subprocess
+        *subprocess_guard = Some(subprocess);
+
         // Spawn reader task to handle stdout from the agent
-        let mut reader = subprocess.stdout_reader();
         tokio::spawn(async move {
             loop {
-                match reader.read_line().await {
-                    Ok(Some(line)) => {
+                let mut line = String::new();
+                let read_result = {
+                    let mut reader = stdout_reader.lock().await;
+                    reader.read_line(&mut line).await
+                };
+
+                match read_result {
+                    Ok(0) => {
+                        warn!("Agent stdout closed (EOF)");
+                        break;
+                    }
+                    Ok(_) => {
+                        let trimmed = line.trim();
+                        if trimmed.is_empty() {
+                            continue; // Skip empty lines
+                        }
+
                         if let Err(e) = Self::handle_agent_message(
-                            &line,
+                            trimmed,
                             &pending_requests,
                             &notification_subscribers,
                         ).await {
                             error!("Failed to handle agent message: {}", e);
                         }
-                    }
-                    Ok(None) => {
-                        warn!("Agent stdout closed");
-                        break;
                     }
                     Err(e) => {
                         error!("Failed to read from agent stdout: {}", e);
@@ -163,9 +180,8 @@ impl AgentBridge {
             // Mark subprocess as dead
             let mut guard = subprocess_arc.write().await;
             *guard = None;
+            info!("Agent reader task exited");
         });
-
-        *subprocess_guard = Some(subprocess);
 
         info!("Agent bridge started successfully");
         Ok(())

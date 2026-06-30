@@ -154,28 +154,61 @@ class AgentBridgeServer:
         logger.info(f"Starting session: {session_id} platform={platform}")
 
         try:
-            # Create a simple session object
-            # TODO: Initialize actual AIAgent instance
+            # Import AIAgent dynamically to avoid startup errors
+            try:
+                from run_agent import AIAgent
+            except ImportError as e:
+                logger.error(f"Failed to import AIAgent: {e}")
+                logger.warning("Falling back to mock agent")
+                AIAgent = None
+
+            # Extract config parameters
+            model = config.get("model", "claude-opus-4")
+            max_turns = config.get("max_turns", 90)
+            toolsets = config.get("toolsets", ["default"])
+
+            # Initialize real AIAgent if available
+            agent = None
+            tools_loaded = 0
+
+            if AIAgent is not None:
+                try:
+                    agent = AIAgent(
+                        model=model,
+                        max_turns=max_turns,
+                        provider="anthropic",
+                        session_id=session_id,
+                        toolsets=toolsets,
+                        status_callback=lambda msg: logger.info(f"[Agent] {msg}"),
+                    )
+                    tools_loaded = len(getattr(agent, 'tools', []))
+                    logger.info(f"Real AIAgent initialized with {tools_loaded} tools")
+                except Exception as e:
+                    logger.error(f"Failed to initialize AIAgent: {e}\n{traceback.format_exc()}")
+                    logger.warning("Continuing with mock agent")
+                    agent = None
+
             session = {
                 "session_id": session_id,
                 "platform": platform,
                 "chat_id": chat_id,
                 "user_id": user_id,
                 "config": config,
+                "agent": agent,  # Real AIAgent instance or None
                 "conversation_history": [],
-                "tools_loaded": 0,  # TODO: load actual tools
+                "tools_loaded": tools_loaded,
             }
 
             self.sessions[session_id] = session
             self.interrupt_flags[session_id] = threading.Event()
 
-            logger.info(f"Session created: {session_id}")
+            logger.info(f"Session created: {session_id} (agent={'real' if agent else 'mock'})")
 
             return {
                 "status": "ready",
                 "session_id": session_id,
-                "loaded_tools": session["tools_loaded"],
-                "memory_snapshots": 0  # TODO: count actual memory snapshots
+                "loaded_tools": tools_loaded,
+                "memory_snapshots": 0
             }
 
         except Exception as e:
@@ -203,6 +236,7 @@ class AgentBridgeServer:
             raise Exception(f"Session not found: {session_id}")
 
         chat_id = session["chat_id"]
+        agent = session.get("agent")
 
         try:
             # Send typing indicator
@@ -214,32 +248,105 @@ class AgentBridgeServer:
             # Generate a message ID for tracking
             message_id = f"msg_{session_id}_{len(session['conversation_history'])}"
 
-            # TODO: Run actual agent loop with streaming
-            # For now, send a placeholder response
+            import time
+            start_time = time.time()
 
-            # Simulate streaming response
-            response_text = f"收到消息: {text}\n\n这是一个占位响应。需要实现完整的 agent loop。"
+            # Use real agent if available
+            if agent is not None:
+                try:
+                    # Callbacks for streaming
+                    accumulated_text = []
+                    tool_calls = []
 
-            # Stream chunks
-            for i, chunk in enumerate(response_text.split()):
-                self.send_notification("stream_chunk", {
-                    "session_id": session_id,
-                    "chat_id": chat_id,
-                    "text": chunk + " ",
-                    "is_final": False
-                })
-                await asyncio.sleep(0.05)  # Simulate streaming delay
+                    def on_text_chunk(chunk: str):
+                        """Called for each streaming text chunk"""
+                        accumulated_text.append(chunk)
+                        self.send_notification("stream_chunk", {
+                            "session_id": session_id,
+                            "chat_id": chat_id,
+                            "text": chunk,
+                            "is_final": False
+                        })
 
-            # Send final completion
+                    def on_tool_start(tool_name: str, tool_input: Dict[str, Any]):
+                        """Called when a tool starts executing"""
+                        tool_calls.append({"name": tool_name, "input": tool_input})
+                        self.send_notification("tool_started", {
+                            "session_id": session_id,
+                            "chat_id": chat_id,
+                            "tool_name": tool_name,
+                            "tool_params": tool_input
+                        })
+
+                    def on_tool_complete(tool_name: str, result: Any):
+                        """Called when a tool completes"""
+                        self.send_notification("tool_completed", {
+                            "session_id": session_id,
+                            "chat_id": chat_id,
+                            "tool_name": tool_name,
+                            "result": str(result)[:200]  # Truncate for notification
+                        })
+
+                    # Run agent conversation (sync call, but in executor to avoid blocking)
+                    loop = asyncio.get_event_loop()
+                    result = await loop.run_in_executor(
+                        None,
+                        lambda: agent.run_conversation(
+                            text,
+                            on_text_chunk=on_text_chunk,
+                            on_tool_start=on_tool_start,
+                            on_tool_complete=on_tool_complete
+                        )
+                    )
+
+                    response_text = "".join(accumulated_text)
+                    duration_ms = int((time.time() - start_time) * 1000)
+
+                    # Extract metadata
+                    metadata = {
+                        "tokens": {
+                            "input": getattr(result, 'input_tokens', 0),
+                            "output": getattr(result, 'output_tokens', 0)
+                        },
+                        "model": agent.model,
+                        "provider": getattr(agent, 'provider', 'unknown'),
+                        "duration_ms": duration_ms,
+                        "tool_count": len(tool_calls)
+                    }
+
+                except Exception as e:
+                    logger.error(f"Real agent failed: {e}\n{traceback.format_exc()}")
+                    logger.warning("Falling back to mock response")
+                    agent = None  # Fall through to mock
+
+            # Fallback: mock response if no agent
+            if agent is None:
+                response_text = f"🤖 收到消息: {text}\n\n⚠️ 当前使用模拟响应（真实 Agent 未加载）。\n\n请确保已安装依赖：\n```\npip install httpx websockets anthropic\n```"
+
+                # Simulate streaming
+                for chunk in response_text.split():
+                    self.send_notification("stream_chunk", {
+                        "session_id": session_id,
+                        "chat_id": chat_id,
+                        "text": chunk + " ",
+                        "is_final": False
+                    })
+                    await asyncio.sleep(0.03)
+
+                metadata = {
+                    "tokens": {"input": 0, "output": 0},
+                    "model": session["config"].get("model", "mock"),
+                    "provider": "mock",
+                    "duration_ms": int((time.time() - start_time) * 1000),
+                    "tool_count": 0
+                }
+
+            # Send completion notification
             self.send_notification("message_complete", {
                 "session_id": session_id,
                 "chat_id": chat_id,
                 "text": response_text,
-                "metadata": {
-                    "tokens": {"input": 0, "output": 0},
-                    "model": session["config"].get("model", "unknown"),
-                    "duration_ms": 0
-                }
+                "metadata": metadata
             })
 
             # Store in conversation history
@@ -252,7 +359,7 @@ class AgentBridgeServer:
                 "content": response_text
             })
 
-            logger.info(f"Message processed for session {session_id}")
+            logger.info(f"Message processed for session {session_id} in {metadata['duration_ms']}ms")
 
             # Return immediate acknowledgment
             return {
